@@ -45,6 +45,33 @@ def _create(client) -> str:
     return m.group(1)
 
 
+def test_the_forms_take_a_runs_tool_settings(stack, monkeypatch):
+    client, service = stack
+    monkeypatch.setattr("specimux_cloud.runapi.service.suite_takes_tool_settings", lambda: True)
+    _login(client)
+    assert 'name="tools"' in client.get("/console/new").text
+    r = client.post("/console/new", data={"profile": "default", "min_reads": "3", "user_id": "user-1",
+                                          "tools": "summarize.merge-position-count=5\n\n speconsense.presample=500 \n",
+                                          "client_token": "ct-tools"}, files=FILES)
+    assert r.status_code == 200, r.text
+    run = sorted(service.store.list_runs(host="dev"), key=lambda r: r["created"])[-1]
+    assert run["spec"]["tools"] == {"summarize": {"merge-position-count": 5}, "speconsense": {"presample": 500}}
+    # left blank nothing is sent: the profile's settings
+    client.post("/console/new", data={"profile": "default", "min_reads": "3", "user_id": "user-1", "tools": "",
+                                      "client_token": "ct-tools-blank"}, files=FILES)
+    assert "tools" not in sorted(service.store.list_runs(host="dev"), key=lambda r: r["created"])[-1]["spec"]
+    # a line that is not a setting the service takes: back to the form saying which, nothing created
+    before = len(service.store.list_runs(host="dev"))
+    r = client.post("/console/new", data={"profile": "default", "min_reads": "3", "tools": "summarize.output=/tmp",
+                                          "client_token": "ct-tools-bad"}, files=FILES)
+    assert r.status_code == 303 and "summarize.output" in r.headers["location"]
+    assert len(service.store.list_runs(host="dev")) == before
+    # the rerun form starts from the source's settings
+    service.store.update_run(run["id"], {"state": "failed", "exit": {"code": 1, "generation": 1, "reported": time.time()}})
+    form = client.get(f"/console/runs/{run['id']}/again").text
+    assert "summarize.merge-position-count=5\nspeconsense.presample=500</textarea>" in form
+
+
 def test_login_logout_and_the_runs_list(stack):
     client, service = stack
     r = client.get("/console/")

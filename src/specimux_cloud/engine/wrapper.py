@@ -57,6 +57,7 @@ from specimux_suite.util import USER_AGENT, atomic_write
 
 from ..packages import PACKAGES, build_zip, package_files
 from ..stopsignal import STOPPED_EXIT, STOPPED_REPORT_PATIENCE_S, StopRequested, StopSignal
+from ..toolsettings import tool_pairs
 
 logger = logging.getLogger("specimux_cloud.engine")
 
@@ -226,6 +227,9 @@ def build_engine_command(bundle: dict, work_dir: Path, scratch: Path, run_id: st
     cmd += ["--plugin", "cloud",
             "--plugin-opt", f"run_id={run_id}", "--plugin-opt", f"run_api={run_api}",
             "--plugin-opt", f"job_secret={job_secret}", "--plugin-opt", f"generation={generation}"]
+    # The run's own tool settings, over its profile's (toolsettings.py)
+    for pair in tool_pairs(spec.get("tools") or {}):
+        cmd += ["--set", pair]
     cmd += list(extra_args)
     return cmd
 

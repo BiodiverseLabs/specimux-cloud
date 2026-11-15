@@ -34,6 +34,8 @@ from pathlib import Path
 from typing import Optional
 
 from specimux_suite import __version__ as suite_version
+
+from ..toolsettings import TOOL_SETTINGS, check_tool_settings, suite_takes_tool_settings
 from specimux_suite.state import PipelineState
 from specimux_suite.web.viewer import create_viewer_app
 
@@ -116,7 +118,7 @@ EXTRA_WORKER_MIN_BYTES = 1_000_000_000
 # engine (the basecalled or uploaded FASTQ). It takes the source's files
 # and settings unless its own spec or files replace them.
 RERUN_STARTS = ("basecall", "engine")
-RERUN_INHERITS = ("profile", "min_reads", "reprocess_ratio", "workers", "vcpus")
+RERUN_INHERITS = ("profile", "min_reads", "reprocess_ratio", "workers", "vcpus", "tools")
 RERUN_COPY_WORKERS = 16
 # S3 moves archives/ to Glacier Deep Archive 30 days after upload
 # (infra/stack.py), and restoring from it is not built: a run over an
@@ -434,6 +436,11 @@ class RunService:
         if spec.get("mode") == "live" and spec.get("input") == "pod5":
             raise ServiceError(400, "Live runs take FASTQ; live POD5 (basecalling while sequencing) is not built yet")
         spec = dict(spec)
+        if spec.get("tools") is not None:
+            # the run's own settings for specimux, speconsense and summarize
+            spec["tools"] = self._tool_settings(spec["tools"])
+            if not spec["tools"]:
+                del spec["tools"]
         if spec.get("name") is not None:
             spec["name"] = spec["name"].strip()
         spec.pop("reference_sha256", None)
@@ -699,6 +706,17 @@ class RunService:
             return True
         return False
 
+    def _tool_settings(self, given) -> dict:
+        """A run's spec.tools, checked (toolsettings.py)."""
+        try:
+            tools = check_tool_settings(given)
+        except ValueError as e:
+            raise ServiceError(400, str(e))
+        if tools and not suite_takes_tool_settings():
+            raise ServiceError(400, f"This service's specimux-suite ({suite_version}) does not take "
+                                    "a run's own tool settings")
+        return tools
+
     def _basecall_settings(self, given: dict) -> dict:
         """The basecalling settings a POD5 run will use, defaults filled in
         so the run record says exactly what ran."""
@@ -914,6 +932,9 @@ class RunService:
                 "modes": ["batch", "live"], "inputs": ["fastq", "pod5"],
                 "dorado_models": list(self.config.dorado_models), "basecall_defaults": dict(DEFAULT_BASECALL),
                 "sources": ["upload"] + (["google_drive"] if self.config.drive_api_key else []),
+                # what a host may send in spec.tools; absent when this
+                # service's specimux-suite cannot apply them
+                **({"tools": TOOL_SETTINGS} if suite_takes_tool_settings() else {}),
                 "versions": {"suite": suite_version, "cloud": cloud_version}}
 
     # --- authorization helpers ---
