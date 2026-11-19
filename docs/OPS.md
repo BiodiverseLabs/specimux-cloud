@@ -177,7 +177,13 @@ Rough timings for a 10.5 GB, five-file POD5 set (1.07 M reads):
   - The run API's group carries its decisions (launches, claims, exits).
   - Dorado writes one log stream per worker; its own stderr comes back in
     the run's exit report (`log_tail`).
-  - The engine's group has the pipeline's output.
+  - The engine's group has only the wrapper's lines: the command, the
+    exit code and the package uploads. The pipeline's own output goes to
+    `engine.log` in the run's EFS directory, which the clean-up loop
+    removes an hour after the run ends. Its last 4,000 characters stay
+    in the run's exit report (`log_tail`), and the event log
+    (`events.jsonl`, kept in S3 and in the Extras download) records each
+    step but not the commands.
 - **Run documents:** DynamoDB, `pk = RUN#<id>`, `sk = RUN`, field `doc`.
   Read them with a boto3 resource. `DynamoStore.update_run` (conditional,
   with a callable) is the manual-correction tool, and the last resort.
