@@ -38,8 +38,14 @@ TOOL_SETTINGS: dict[str, dict[str, dict[str, Any]]] = {
         "min-len": {"type": "int", "min": 0, "max": 100_000},
         "min-ric": {"type": "int", "min": 1, "max": 10_000},
         "select-max-variants": {"type": "int", "min": -1, "max": 1000},
-        # a preset (default, minimal, qc, full, id-only) or field names
-        "fasta-fields": {"type": "text", "pattern": "[A-Za-z0-9_.,-]{1,200}"},
+        # a preset (default, minimal, qc, full, id-only) or field names.
+        # The suite passes it as "--fasta-fields VALUE", so a value starting
+        # with a dash reads as an option and every summarize job fails; and
+        # its --set reads true or false (any case) as a flag: true becomes a
+        # bare --fasta-fields, which fails the same way, and false drops it.
+        # No inline flags, so a host can use the pattern as a JavaScript one.
+        "fasta-fields": {"type": "text",
+                         "pattern": "(?![Tt][Rr][Uu][Ee]$|[Ff][Aa][Ll][Ss][Ee]$)[A-Za-z0-9_.][A-Za-z0-9_.,-]{0,199}"},
     },
 }
 
@@ -57,7 +63,8 @@ def _check_value(name: str, rule: dict, value: Any) -> Any:
     kind = rule["type"]
     if kind == "text":
         if not isinstance(value, str) or not re.fullmatch(rule["pattern"], value):
-            raise ValueError(f"{name} may hold letters, digits, commas, dots, dashes and underscores")
+            raise ValueError(f"{name} may hold letters, digits, commas, dots, dashes and underscores, "
+                             "not start with a dash, and not be true or false")
         return value
     whole = kind == "int"
     ok = isinstance(value, int) if whole else isinstance(value, (int, float))

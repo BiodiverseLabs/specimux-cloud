@@ -33,7 +33,15 @@ def test_a_labs_own_settings_are_taken_as_given():
     ({"summarize": {"merge-min-size-ratio": 1.5}}, "number from 0 to 1"),
     ({"summarize": {"select-max-variants": -2}}, "whole number from -1 to 1000"),
     ({"summarize": {"fasta-fields": "ric; rm -rf /"}}, "letters, digits, commas"),
-    ({"summarize": {"fasta-fields": "--source"}}, None),   # dashes are letters of a field list: harmless as a value
+    # the suite passes the value as the next argument, where a leading dash
+    # reads as an option, and its --set turns true and false into a flag
+    ({"summarize": {"fasta-fields": "--source"}}, "not start with a dash"),
+    ({"summarize": {"fasta-fields": "-x"}}, "not start with a dash"),
+    ({"summarize": {"fasta-fields": "true"}}, "not be true or false"),
+    ({"summarize": {"fasta-fields": "False"}}, "not be true or false"),
+    ({"summarize": {"fasta-fields": "id-only"}}, None),    # a dash inside is fine
+    ({"summarize": {"fasta-fields": "ric,size"}}, None),
+    ({"summarize": {"fasta-fields": "trueish"}}, None),    # only the whole value true or false is a flag
 ])
 def test_anything_else_is_refused_and_says_why(bad, says):
     if says is None:
@@ -53,6 +61,6 @@ def test_settings_typed_as_text_come_out_typed():
     # the tool's own spelling with dashes is fine; the later of two wins
     assert parse_tool_pairs(["summarize.--min-len=150", "summarize.min-len=200"]) == {"summarize": {"min-len": 200}}
     for bad in ("min-len=150", "summarize.min-len", "summarize.min-len=", "summarize.min-len=long",
-                "summarize.no-such=1", "summarize.min-len=-5"):
+                "summarize.no-such=1", "summarize.min-len=-5", "summarize.fasta-fields=true"):
         with pytest.raises(ValueError):
             parse_tool_pairs([bad])
