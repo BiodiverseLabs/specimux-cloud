@@ -44,10 +44,14 @@ PROGRESS_LOG_S = 10.0
 PROGRESS_REPORT_S = 15.0
 CHUNK = 1 << 20
 # What one PUT carries (S3). A larger file is sent in parts when the service
-# offers that; the part addresses are asked for a few at a time, since each
-# is good for an hour.
+# offers that. A part's address is asked for just before the part is sent:
+# it is good for an hour at most, and less when the credentials that signed
+# it are near their end. A part storage refuses (an address that expired, a
+# slow connection S3 gave up on) is sent again with a fresh address,
+# PART_TRIES times in all, waiting PART_RETRY_S longer each time.
 SINGLE_PUT_MAX = 5 * 1024 ** 3
-PART_URLS = 8
+PART_TRIES = 3
+PART_RETRY_S = 5.0
 
 
 def _size(n) -> str:
@@ -217,23 +221,29 @@ class Uploader:
         base = sum(length(int(n)) for n in done)   # sent by an earlier start of this uploader
         if done:
             logger.info(f"{name}: carrying on in parts, {len(done)} of {count} already sent")
-        todo = [n for n in range(1, count + 1) if str(n) not in done]
-        while todo:
-            batch, todo = todo[:PART_URLS], todo[PART_URLS:]
-            r = self.client.post(f"{self.base}/v1/runs/{self.run_id}/uploads/parts",
-                                 json={"file": name, "upload_id": flight["upload_id"], "parts": batch},
-                                 headers=self.headers)
-            r.raise_for_status()
-            urls = r.json()["parts"]
-            for n in batch:
-                already = sum(length(int(d)) for d in done)
-                put = self.client.put(urls[str(n)],
+        # the progress log and report run across the parts: a part can take
+        # less than either period, and a fast link would otherwise show none
+        clock = {"logged": started, "reported": started}
+        for n in [n for n in range(1, count + 1) if str(n) not in done]:
+            already = sum(length(int(d)) for d in done)
+            for attempt in range(1, PART_TRIES + 1):
+                r = self.client.post(f"{self.base}/v1/runs/{self.run_id}/uploads/parts",
+                                     json={"file": name, "upload_id": flight["upload_id"], "parts": [n]},
+                                     headers=self.headers)
+                r.raise_for_status()
+                put = self.client.put(r.json()["parts"][str(n)],
                                       content=self._stream(path, size, started, offset=(n - 1) * part_size,
-                                                           length=length(n), already=already, base=base),
+                                                           length=length(n), already=already, base=base,
+                                                           clock=clock),
                                       headers={"Content-Length": str(length(n))})
-                put.raise_for_status()
-                done[str(n)] = (put.headers.get("etag") or "").strip('"')
-                self._save_state()
+                if put.is_success or attempt == PART_TRIES:
+                    break
+                logger.warning(f"{name}: storage refused part {n} of {count} ({put.status_code}); "
+                               "sending it again with a fresh address")
+                time.sleep(PART_RETRY_S * attempt)
+            put.raise_for_status()
+            done[str(n)] = (put.headers.get("etag") or "").strip('"')
+            self._save_state()
         r = self.client.post(f"{self.base}/v1/runs/{self.run_id}/uploads/assemble",
                              json={"file": name, "upload_id": flight["upload_id"], "size": size,
                                    "parts": [{"number": int(n), "etag": e}
@@ -249,14 +259,16 @@ class Uploader:
         return r.json()["etag"]
 
     def _stream(self, path: Path, size: int, started: float, offset: int = 0, length: Optional[int] = None,
-                already: int = 0, base: int = 0):
+                already: int = 0, base: int = 0, clock: Optional[dict] = None):
         """The file in chunks, logging progress every PROGRESS_LOG_S and
         reporting it to the run API every PROGRESS_REPORT_S. For a part:
         ``length`` bytes from ``offset``, with ``already`` bytes of the
-        file sent before it, ``base`` of them before this start."""
+        file sent before it, ``base`` of them before this start, and
+        ``clock`` the times of the last log and report, shared by the
+        file's parts."""
         sent = already
         remaining = size if length is None else length
-        logged = reported = time.monotonic() if already else started
+        clock = {"logged": started, "reported": started} if clock is None else clock
         with open(path, "rb") as f:
             f.seek(offset)
             while remaining > 0 and (chunk := f.read(min(CHUNK, remaining))):
@@ -265,13 +277,13 @@ class Uploader:
                 yield chunk
                 now = time.monotonic()
                 rate = (sent - base) / (now - started) if now > started else 0.0
-                if now - logged >= PROGRESS_LOG_S and sent < size:
-                    logged = now
+                if now - clock["logged"] >= PROGRESS_LOG_S and sent < size:
+                    clock["logged"] = now
                     left = f", about {_duration((size - sent) / rate)} left" if rate else ""
                     logger.info(f"  {path.name}: {100 * sent / size:.0f}% of {_size(size)}"
                                 f" at {_size(rate)}/s{left}")
-                if now - reported >= PROGRESS_REPORT_S and sent < size:
-                    reported = now
+                if now - clock["reported"] >= PROGRESS_REPORT_S and sent < size:
+                    clock["reported"] = now
                     self.report_progress(path.name, sent, size, rate)
 
     def report_progress(self, name: str, sent: int, size: int, rate: float) -> None:

@@ -320,10 +320,11 @@ the pod5 tools would get them in. So a file can go up in parts. The
 uploader names each file's size with its request (`sizes`, bytes by
 name); for one over 5 GB (`single_put_max`) the answer has no `url` but
 `multipart: {upload_id, part_size, parts}`: S3's multipart upload,
-started by the service. The uploader asks for the parts' addresses a few
-at a time (`POST /runs/{id}/uploads/parts` with `file`, `upload_id` and
-part numbers; each address is good for an hour, so a part is asked for
-close to when it is sent), PUTs each part of `part_size` bytes (128 MB;
+started by the service. The uploader asks for each part's address just
+before sending it (`POST /runs/{id}/uploads/parts` with `file`,
+`upload_id` and up to 100 part numbers; an address is good for an hour
+at most, and less when the run API's credentials that signed it are near
+their end), PUTs each part of `part_size` bytes (128 MB;
 the last is the remainder) and keeps the ETag each PUT answers with, then
 `POST /runs/{id}/uploads/assemble` with `file`, `upload_id`, `size` and
 `parts: [{number, etag}]`. The service has storage put the parts
@@ -335,8 +336,11 @@ again, its answer lost on the way, gets the same answer.
 Nothing changes for a file up to 5 GB or an uploader that sends no
 sizes: one PUT, as before. A part sent twice is the last one sent, so
 the uploader keeps the parts it has sent in its state file and a restart
-sends only the rest; if the file changed meanwhile it starts over. The
-bucket already drops an unfinished multipart upload after a week
+sends only the rest; if the file changed meanwhile it starts over. A
+part storage refuses (an address that expired, a slow connection S3 gave
+up on) is sent again with a fresh address, three tries in all, rather
+than stopping an uploader that may be running unattended through a
+night of sequencing. The bucket already drops an unfinished multipart upload after a week
 (`infra/stack.py`), which is the cleanup for an upload that is never
 finished, and the bucket's CORS rule already lets a browser PUT a part
 and read its ETag. `GET /options` lists `uploads: {single_put_max,
