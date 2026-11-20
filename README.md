@@ -192,7 +192,12 @@ specimux-cloud submit --run-api https://runs.specimux.com --service-key <key> \
 
 POD5 input is detected from the files; `--model`, `--min-length`,
 `--max-length` and `--min-qscore` set basecalling, and `--profile` and
-`--min-reads` the pipeline. `--live` makes a live run of a folder the
+`--min-reads` the pipeline. `--set tool.option=value` (repeatable) gives
+the run its own setting for one option of specimux, speconsense or
+speconsense-summarize, over the profile's: `--set
+summarize.merge-position-count=5 --set speconsense.presample=500`
+(`GET /v1/options` lists the ones the service takes, under `tools`).
+`--live` makes a live run of a folder the
 uploader keeps watching. The service keeps each reference database once,
 by its SHA-256, so `submit` sends a reference only the first time your
 host uses it (another host's copy is never lent: each host sends a

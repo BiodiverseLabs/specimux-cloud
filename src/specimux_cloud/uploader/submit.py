@@ -46,6 +46,7 @@ from typing import Optional
 import httpx
 
 from ..packages import download_name
+from ..toolsettings import parse_tool_pairs
 from .cli import Uploader, check_service
 
 logger = logging.getLogger("specimux_cloud.submit")
@@ -82,6 +83,11 @@ def run(argv: Optional[list[str]] = None) -> int:
                          "e.g. Run150 -> Run150_Summary.zip")
     ap.add_argument("--profile", default=None, help="Default: default (a rerun: the source's)")
     ap.add_argument("--min-reads", type=int, default=None, help="Default: 10 (a rerun: the source's)")
+    ap.add_argument("--set", action="append", default=[], metavar="TOOL.OPTION=VALUE",
+                    help="One of the run's own settings for specimux, speconsense or summarize, over the "
+                         "profile's (repeatable), e.g. --set summarize.merge-position-count=5 "
+                         "--set speconsense.presample=500; GET /v1/options lists the ones the service takes "
+                         "(a rerun: the source's unless any is given)")
     ap.add_argument("--vcpus", type=int, default=None, help="Engine job size (default: the service's)")
     ap.add_argument("--input", choices=["fastq", "pod5"], default=None,
                     help="Input kind (default: pod5 if any input file is .pod5, else fastq)")
@@ -140,6 +146,12 @@ def run(argv: Optional[list[str]] = None) -> int:
         spec["name"] = args.name
     if args.vcpus:
         spec["vcpus"] = args.vcpus
+    if args.set:
+        try:
+            spec["tools"] = parse_tool_pairs(args.set)
+        except ValueError as e:
+            logger.error(str(e))
+            return 2
     basecall = {k: v for k, v in (("model", args.model), ("min_length", args.min_length),
                                   ("max_length", args.max_length), ("min_qscore", args.min_qscore)) if v is not None}
     if basecall and kind != "pod5":

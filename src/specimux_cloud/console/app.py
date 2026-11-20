@@ -33,6 +33,7 @@ from starlette.datastructures import UploadFile
 
 from ..packages import DOWNLOAD_LABEL, download_name
 from ..progress import basecall_text, engine_text, upload_text
+from ..toolsettings import parse_tool_pairs, tool_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +306,7 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
 <select id="reference_sha256" name="reference_sha256"><option value="">none</option>{refs}</select>
 <label for="profile">Profile</label><select id="profile" name="profile">{profiles}</select>
 <label for="min_reads">Minimum reads per specimen</label><input type="number" id="min_reads" name="min_reads" value="10" min="1">
+<label for="tools">Tool settings (optional, one per line as tool.option=value, e.g. <code>summarize.merge-position-count=5</code>; the profile's otherwise)</label><textarea id="tools" name="tools" rows="3"></textarea>
 <label for="mode">Mode</label><select id="mode" name="mode">
 <option value="batch">Batch: upload a finished run, then process it</option>
 <option value="live">Live: process FASTQ as it arrives, while sequencing</option></select>
@@ -333,6 +335,7 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
         else:
             start = '<input type="hidden" name="start" value="engine">'
         name = f"{src['name']} rerun" if src.get("name") else ""
+        tools_text = "\n".join(tool_pairs(src.get("tools") or {}))
         return page(f"Run {sid} again", f"""
 <form method="post" action="{mount}/new" enctype="multipart/form-data" class="card">
 <h2>Run <code>{esc(sid)}</code> again</h2>{err}{load_line(load)}
@@ -347,6 +350,7 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
 <select id="reference_sha256" name="reference_sha256">{refs}</select>
 <label for="profile">Profile</label><select id="profile" name="profile">{profiles}</select>
 <label for="min_reads">Minimum reads per specimen</label><input type="number" id="min_reads" name="min_reads" value="{esc(src.get("min_reads") or 10)}" min="1">
+<label for="tools">Tool settings (optional, one per line as tool.option=value, e.g. <code>summarize.merge-position-count=5</code>; the profile's otherwise)</label><textarea id="tools" name="tools" rows="3">{esc(tools_text)}</textarea>
 {basecalling if pod5 else ""}
 <input type="hidden" name="user_id" value="{esc(source.get("user_id"))}">
 {token}
@@ -374,6 +378,13 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
                 spec["source"] = {"google_drive": str(form.get("drive_folder")).strip()}
         if str(form.get("name") or "").strip():
             spec["name"] = str(form.get("name")).strip()
+        tool_lines = [line.strip() for line in str(form.get("tools") or "").splitlines() if line.strip()]
+        if tool_lines or rerun_of:
+            # a rerun's form shows its source's settings: what is left in it is what the rerun gets
+            try:
+                spec["tools"] = parse_tool_pairs(tool_lines)
+            except ValueError as e:
+                return RedirectResponse(f"{back}?{urlencode({'error': str(e)})}", status_code=303)
         try:
             spec["min_reads"] = int(form.get("min_reads") or 10)
             if basecall:

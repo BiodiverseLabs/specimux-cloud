@@ -1410,6 +1410,67 @@ def test_a_rerun_from_basecalling_and_its_settings(api):
     assert _rerun(client, sid, {"start": "basecall", "basecall": {"model": "sup@v1"}}).status_code == 400
 
 
+def test_a_run_may_carry_its_own_tool_settings(api, monkeypatch):
+    client, service, launcher = api
+    monkeypatch.setattr("specimux_cloud.runapi.service.suite_takes_tool_settings", lambda: True)
+    lab = {"specimux": {"index-edit-distance": 3}, "speconsense": {"presample": 500},
+           "summarize": {"merge-position-count": 5, "min-len": 150, "merge-min-size-ratio": 0.05,
+                         "fasta-fields": "ric,snp"}}
+
+    def create(spec_extra, token):
+        data = {"spec": json.dumps({"mode": "batch", "input": "fastq", **spec_extra}), "user_id": "u42",
+                "client_token": token}
+        files = {"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+                 "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}
+        return client.post("/v1/runs", data=data, files=files, headers={"X-Service-Key": KEY})
+
+    # a host learns from the options which settings it may send, and their limits
+    tools = client.get("/v1/options", headers={"X-Service-Key": KEY}).json()["tools"]
+    assert tools["specimux"]["index-edit-distance"] == {"type": "int", "min": 0, "max": 10}
+    assert set(tools) == {"specimux", "speconsense", "summarize"} and "merge-position-count" in tools["summarize"]
+    # left out, the run has none: the profile's settings, as before
+    assert "tools" not in _create(client)["spec"]
+    assert "tools" not in create({"tools": {}}, "ct-tools-empty").json()["spec"]
+    r = create({"tools": lab}, "ct-tools-1")
+    assert r.status_code == 200, r.text
+    first = r.json()
+    assert first["spec"]["tools"] == lab
+    # anything the service does not list, or out of its limits, is refused and nothing is created
+    before = len(service.store.list_runs(host="dev"))
+    for n, bad in enumerate([{"summarize": {"summary-dir": "/tmp"}}, {"speconsense": {"primers": "x"}},
+                             {"identify": {"x": 1}}, {"specimux": {"index-edit-distance": 99}},
+                             {"summarize": {"fasta-fields": "a b"}}, "summarize.min-len=150"]):
+        r = create({"tools": bad}, f"ct-tools-bad-{n}")
+        assert r.status_code == 400 and "tools" in r.json()["error"], (bad, r.text)
+    assert len(service.store.list_runs(host="dev")) == before
+    # the engine's job carries them
+    _upload(client, first, "x.fastq", b"@r\nA\n+\nI\n")
+    client.post(f"/v1/runs/{first['id']}/complete", headers={"Authorization": f"JobCode {first['job_code']}"})
+    eng = {"X-Job-Secret": launcher.specs[-1].env["SPECIMUX_JOB_SECRET"]}
+    assert client.get(f"/v1/runs/{first['id']}/job", headers=eng).json()["spec"]["tools"] == lab
+    client.post(f"/v1/runs/{first['id']}/exit", json={"generation": 1, "exit_code": 0}, headers=eng)
+    _wait_state(service, first["id"], ["sealed"])
+    # a rerun keeps the source's unless the request gives its own, which replace them whole
+    assert _rerun(client, first["id"], {}).json()["spec"]["tools"] == lab
+    own = {"summarize": {"merge-position-count": 2}}
+    assert _rerun(client, first["id"], {"tools": own}).json()["spec"]["tools"] == own
+    assert "tools" not in _rerun(client, first["id"], {"tools": {}}).json()["spec"]
+    assert _rerun(client, first["id"], {"tools": {"summarize": {"min-ric": 0}}}).status_code == 400
+
+
+def test_a_service_whose_suite_cannot_apply_tool_settings_says_so(api, monkeypatch):
+    client, service, launcher = api
+    monkeypatch.setattr("specimux_cloud.runapi.service.suite_takes_tool_settings", lambda: False)
+    assert "tools" not in client.get("/v1/options", headers={"X-Service-Key": KEY}).json()
+    data = {"spec": json.dumps({"mode": "batch", "input": "fastq", "tools": {"speconsense": {"presample": 500}}}),
+            "user_id": "u42", "client_token": "ct-tools-old-suite"}
+    files = {"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+             "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}
+    r = client.post("/v1/runs", data=data, files=files, headers={"X-Service-Key": KEY})
+    # refused, never dropped: nobody is left believing a setting was used
+    assert r.status_code == 400 and "does not take a run's own tool settings" in r.json()["error"]
+
+
 def test_a_rerun_of_a_fastq_run(api):
     client, service, launcher = api
     first = _create(client)

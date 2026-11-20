@@ -237,12 +237,41 @@ and two hours of basecalling. Reruns are checked the same way, over
 the files they inherit. The run records what was checked
 (`input_check`: specimens, primers, pools, specimux version).
 
+**Tool settings.** A profile is a named set of settings that ships with
+the suite. A lab that has run the tools by hand has its own numbers for
+a few of their options and wants the service's run to match its own:
+how many differences two variants may have and still merge, how many
+reads are sampled per specimen, a fixed barcode tolerance. `spec.tools`
+carries them, by tool and by the tool's own long option:
+
+```json
+{"specimux": {"index-edit-distance": 3},
+ "speconsense": {"presample": 500},
+ "summarize": {"merge-position-count": 5, "min-merge-overlap": 100,
+               "merge-min-size-ratio": 0.05, "min-len": 150, "fasta-fields": "ric,snp"}}
+```
+
+The service takes only the options in `toolsettings.py`, each with a
+type and limits, and refuses the run otherwise: the values end up on a
+command line. `GET /v1/options` lists them under `tools`, so a host
+offers what the service takes and no more; the list is absent when the
+service's specimux-suite has no `--set`, and a run that
+sends settings then is refused, not run without them. The engine
+passes each as `--set tool.option=value`, which the suite applies over
+the run's profile. The console's forms take them one per line, `submit`
+as `--set`, and a rerun keeps its source's unless it gives its own,
+which replace them whole. `specimux.index-edit-distance` is the one a
+lab mixing two generations of index sets needs: left out, specimux
+takes half the distance between the sheet's two closest barcodes, so
+moving three plates to an older index set took one run from 3 to 2 and
+every plate lost about a tenth of its reads.
+
 **Reruns.** A finished run (sealed or failed) runs again as a new run:
 `POST /v1/runs` with `spec.rerun_of` and `spec.start`, `engine` (the
 default) or `basecall` (POD5 only). It never uploads: it is created
 with the source's manifest and goes straight to `input_complete`, and
 the create returns no job code. Primers, specimens, the reference,
-profile, minimum reads and the basecalling settings are the source's
+profile, minimum reads, tool settings and the basecalling settings are the source's
 unless the request replaces them (`reference_sha256: none` drops the
 reference); it is always batch, and belongs to the source's user, under
 whose prefix the input lives. From basecalling it runs over the source's

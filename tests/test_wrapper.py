@@ -137,6 +137,26 @@ def test_batch_staging_decompresses_gzipped_reads(tmp_path, monkeypatch):
     assert not (work / "downloads").exists()
 
 
+def test_a_runs_tool_settings_go_to_the_suite_as_set(tmp_path):
+    from specimux_cloud.engine.wrapper import build_engine_command
+
+    def command(spec, extra):
+        return build_engine_command({"spec": spec}, tmp_path / "work", tmp_path / "scratch", "r1", "http://api", "s", 1, extra)
+
+    tools = {"specimux": {"index-edit-distance": 3}, "speconsense": {"presample": 500},
+             "summarize": {"merge-position-count": 5, "merge-min-size-ratio": 0.05, "select-max-variants": -1,
+                           "fasta-fields": "ric,snp"}}
+    cmd = command({"mode": "batch", "profile": "default", "tools": tools}, ["--log-level", "DEBUG"])
+    given = [cmd[i + 1] for i, c in enumerate(cmd) if c == "--set"]
+    assert given == ["specimux.index-edit-distance=3", "speconsense.presample=500",
+                     "summarize.merge-position-count=5", "summarize.merge-min-size-ratio=0.05",
+                     "summarize.select-max-variants=-1", "summarize.fasta-fields=ric,snp"]
+    # over the profile, which is still named, and before the operator's extra arguments
+    assert cmd.index("--profile") < cmd.index("--set") and cmd[-2:] == ["--log-level", "DEBUG"]
+    # left out: the command is what it was
+    assert "--set" not in command({"mode": "batch", "profile": "default"}, [])
+
+
 def test_the_logged_engine_command_carries_no_job_secret():
     from specimux_cloud.engine.wrapper import redact_secret
     cmd = ["specimux-suite", "batch", "--plugin-opt", "job_secret=s3cr3t-value", "--plugin-opt", "generation=3"]
