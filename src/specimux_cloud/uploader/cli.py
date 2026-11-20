@@ -43,6 +43,11 @@ FAILED_DIRS = ("fastq_fail", "pod5_fail")   # MinKNOW's reads that failed its qu
 PROGRESS_LOG_S = 10.0
 PROGRESS_REPORT_S = 15.0
 CHUNK = 1 << 20
+# What one PUT carries (S3). A larger file is sent in parts when the service
+# offers that; the part addresses are asked for a few at a time, since each
+# is good for an hour.
+SINGLE_PUT_MAX = 5 * 1024 ** 3
+PART_URLS = 8
 
 
 def _size(n) -> str:
@@ -109,6 +114,9 @@ class Uploader:
         self.headers = {"Authorization": f"JobCode {job_code}"}
         self.reports = True   # False once the run API turns out not to take progress reports
 
+        # files being sent in parts: the parts already up, so a restart
+        # sends only the rest
+        self.parts: dict[str, dict] = {}
         self.done: dict[str, dict] = self._load_state()
         # every request names this uploader and its version: the run API
         # refuses one older than its minimum (versioning.py)
@@ -123,6 +131,7 @@ class Uploader:
         try:
             data = json.loads(self.state_path.read_text())
             if data.get("run_id") == self.run_id:
+                self.parts = data.get("parts", {})
                 return data.get("uploaded", {})
         except (OSError, ValueError):
             pass
@@ -130,7 +139,10 @@ class Uploader:
 
     def _save_state(self) -> None:
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"run_id": self.run_id, "uploaded": self.done}, indent=1))
+        state = {"run_id": self.run_id, "uploaded": self.done}
+        if self.parts:
+            state["parts"] = self.parts
+        tmp.write_text(json.dumps(state, indent=1))
         tmp.replace(self.state_path)
 
     # --- one file ---
@@ -149,15 +161,31 @@ class Uploader:
         prev = self.done.get(name)
         if prev and prev.get("size") == size and prev.get("md5") == md5:
             return prev
-        r = self.client.post(f"{self.base}/v1/runs/{self.run_id}/uploads",
-                             json={"files": [name]}, headers=self.headers)
-        r.raise_for_status()
-        target = r.json()["uploads"][name]
+        flight = self.parts.get(name)
+        if flight and (flight.get("size") != size or flight.get("md5") != md5):
+            flight = None   # the file changed since: those parts are of another file
+            self.parts.pop(name, None)
+        if flight:
+            target = {"key": flight["key"], "multipart": {"upload_id": flight["upload_id"],
+                                                          "part_size": flight["part_size"],
+                                                          "parts": flight["count"]}}
+        else:
+            r = self.client.post(f"{self.base}/v1/runs/{self.run_id}/uploads",
+                                 json={"files": [name], "sizes": {name: size}}, headers=self.headers)
+            r.raise_for_status()
+            target = r.json()["uploads"][name]
         started = time.monotonic()
-        put = self.client.put(target["url"], content=self._stream(path, size, started),
-                              headers={"Content-Length": str(size)})   # storage takes no chunked body
-        put.raise_for_status()
-        etag = (put.headers.get("etag") or "").strip('"')
+        if target.get("multipart"):
+            etag = self._upload_in_parts(path, size, md5, target, started)
+        else:
+            if size > SINGLE_PUT_MAX:
+                raise SystemExit(f"{name} is {_size(size)}: more than one upload carries (5 GB), and this "
+                                 "service does not take a file in parts. Split the file, or ask the "
+                                 "service's operator to update it.")
+            put = self.client.put(target["url"], content=self._stream(path, size, started),
+                                  headers={"Content-Length": str(size)})   # storage takes no chunked body
+            put.raise_for_status()
+            etag = (put.headers.get("etag") or "").strip('"')
         record = {"key": target["key"], "size": size, "md5": md5, "etag": etag, "uploaded": time.time()}
         self.done[name] = record
         self._save_state()
@@ -168,17 +196,75 @@ class Uploader:
                     + f"); {len(self.done)} file(s), {_size(total)} uploaded so far")
         return record
 
-    def _stream(self, path: Path, size: int, started: float):
+    def _upload_in_parts(self, path: Path, size: int, md5: str, target: dict, started: float) -> str:
+        """Send a file over what one PUT carries as parts, each a PUT of
+        its own, then have the service assemble them. The parts already
+        sent are kept in the state file, so a restart carries on."""
+        name = path.name
+        mp = target["multipart"]
+        part_size, count = int(mp["part_size"]), int(mp["parts"])
+        flight = self.parts.get(name)
+        if not flight or flight.get("upload_id") != mp["upload_id"]:
+            flight = {"key": target["key"], "upload_id": mp["upload_id"], "part_size": part_size, "count": count,
+                      "size": size, "md5": md5, "done": {}}
+            self.parts[name] = flight
+            self._save_state()
+        done = flight["done"]
+
+        def length(n: int) -> int:
+            return min(part_size, size - (n - 1) * part_size)
+
+        base = sum(length(int(n)) for n in done)   # sent by an earlier start of this uploader
+        if done:
+            logger.info(f"{name}: carrying on in parts, {len(done)} of {count} already sent")
+        todo = [n for n in range(1, count + 1) if str(n) not in done]
+        while todo:
+            batch, todo = todo[:PART_URLS], todo[PART_URLS:]
+            r = self.client.post(f"{self.base}/v1/runs/{self.run_id}/uploads/parts",
+                                 json={"file": name, "upload_id": flight["upload_id"], "parts": batch},
+                                 headers=self.headers)
+            r.raise_for_status()
+            urls = r.json()["parts"]
+            for n in batch:
+                already = sum(length(int(d)) for d in done)
+                put = self.client.put(urls[str(n)],
+                                      content=self._stream(path, size, started, offset=(n - 1) * part_size,
+                                                           length=length(n), already=already, base=base),
+                                      headers={"Content-Length": str(length(n))})
+                put.raise_for_status()
+                done[str(n)] = (put.headers.get("etag") or "").strip('"')
+                self._save_state()
+        r = self.client.post(f"{self.base}/v1/runs/{self.run_id}/uploads/assemble",
+                             json={"file": name, "upload_id": flight["upload_id"], "size": size,
+                                   "parts": [{"number": int(n), "etag": e}
+                                             for n, e in sorted(done.items(), key=lambda kv: int(kv[0]))]},
+                             headers=self.headers)
+        if r.status_code == 409:
+            # the parts are no longer there (storage drops an unfinished
+            # upload after a week), or did not make the file: start it over
+            self.parts.pop(name, None)
+            self._save_state()
+        r.raise_for_status()
+        self.parts.pop(name, None)
+        return r.json()["etag"]
+
+    def _stream(self, path: Path, size: int, started: float, offset: int = 0, length: Optional[int] = None,
+                already: int = 0, base: int = 0):
         """The file in chunks, logging progress every PROGRESS_LOG_S and
-        reporting it to the run API every PROGRESS_REPORT_S."""
-        sent = 0
-        logged = reported = started
+        reporting it to the run API every PROGRESS_REPORT_S. For a part:
+        ``length`` bytes from ``offset``, with ``already`` bytes of the
+        file sent before it, ``base`` of them before this start."""
+        sent = already
+        remaining = size if length is None else length
+        logged = reported = time.monotonic() if already else started
         with open(path, "rb") as f:
-            while chunk := f.read(CHUNK):
+            f.seek(offset)
+            while remaining > 0 and (chunk := f.read(min(CHUNK, remaining))):
+                remaining -= len(chunk)
                 sent += len(chunk)
                 yield chunk
                 now = time.monotonic()
-                rate = sent / (now - started) if now > started else 0.0
+                rate = (sent - base) / (now - started) if now > started else 0.0
                 if now - logged >= PROGRESS_LOG_S and sent < size:
                     logged = now
                     left = f", about {_duration((size - sent) / rate)} left" if rate else ""

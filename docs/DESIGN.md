@@ -192,7 +192,8 @@ All under `/v1`. "Service key" routes see only the calling host's runs.
 | `POST /runs/{id}/tokens` (mint a run token) | host's authorize route | service key |
 | `GET /hosts/me`, `GET /options`, `GET /load`, `GET /references/sha256/{hex}` | host | service key |
 | `GET /version` | anyone | none |
-| `POST /runs/{id}/uploads` (presigned PUTs) | uploader | job code |
+| `POST /runs/{id}/uploads` (presigned PUTs; with `sizes`, a file over 5 GB gets an upload in parts) | uploader | job code |
+| `POST /runs/{id}/uploads/parts` (presigned PUTs for parts), `POST /runs/{id}/uploads/assemble` (the parts become the file) | uploader | job code |
 | `GET /runs/{id}/upload` (does the run still take uploads) | uploader | job code, also after the run closes |
 | `POST /runs/{id}/complete` (manifest, or none: built from the listing) | uploader, host | job code or service key |
 | `GET /runs/{id}/job` (bundle) | any job | job secret, active job |
@@ -311,6 +312,37 @@ waiting for a fetch slot stays `created`; the dashboard banner says
 "Copying from Google Drive". The key goes in the `X-Goog-Api-Key`
 header, never in a URL (request logs and errors can't carry it), and
 reaches the job only in its bundle.
+
+**Files over 5 GB.** A presigned PUT is one request, and S3 takes at
+most 5 GB in one. MinKNOW writes POD5 files larger than that: a run of
+five files had three of 6 GB, and nothing short of splitting them with
+the pod5 tools would get them in. So a file can go up in parts. The
+uploader names each file's size with its request (`sizes`, bytes by
+name); for one over 5 GB (`single_put_max`) the answer has no `url` but
+`multipart: {upload_id, part_size, parts}`: S3's multipart upload,
+started by the service. The uploader asks for the parts' addresses a few
+at a time (`POST /runs/{id}/uploads/parts` with `file`, `upload_id` and
+part numbers; each address is good for an hour, so a part is asked for
+close to when it is sent), PUTs each part of `part_size` bytes (128 MB;
+the last is the remainder) and keeps the ETag each PUT answers with, then
+`POST /runs/{id}/uploads/assemble` with `file`, `upload_id`, `size` and
+`parts: [{number, etag}]`. The service has storage put the parts
+together and answers `{key, size, etag}`: the file's entry for the
+manifest. An object that does not come out the announced size (a part
+left off the list) is deleted and the request refused. The same request
+again, its answer lost on the way, gets the same answer.
+
+Nothing changes for a file up to 5 GB or an uploader that sends no
+sizes: one PUT, as before. A part sent twice is the last one sent, so
+the uploader keeps the parts it has sent in its state file and a restart
+sends only the rest; if the file changed meanwhile it starts over. The
+bucket already drops an unfinished multipart upload after a week
+(`infra/stack.py`), which is the cleanup for an upload that is never
+finished, and the bucket's CORS rule already lets a browser PUT a part
+and read its ETag. `GET /options` lists `uploads: {single_put_max,
+part_size}`, so a host that uploads from its own page knows it may send
+a file of any size. A run from a Google Drive folder still stops at 5 GB
+a file: that copy is one PUT of the service's own.
 
 **Abandoned uploads.** The two-minute reconcile ends a run with no upload
 request for 24 hours, or created and never uploaded to within 7 days (a
